@@ -2,20 +2,20 @@ package vhostuser
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/lab47/lnf/pkg/lldp"
+	ringbuf "github.com/lab47/lnf/pkg/ring_buf"
+	ethswitch "github.com/lab47/lnf/switch"
 	"github.com/lab47/lsvd/logger"
-	"github.com/mdlayher/ethernet"
 	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
 )
@@ -74,6 +74,12 @@ var requestNames = map[uint32]string{
 	VHOST_USER_MAX:                   "max",
 }
 
+var kickBuf = make([]byte, 8)
+
+func init() {
+	binary.NativeEndian.PutUint64(kickBuf, 1)
+}
+
 type UserMemoryRegion struct {
 	Guest_phys_addr uint64
 	Memory_size     uint64
@@ -127,16 +133,6 @@ type UserMsg struct {
 	UserMsgHeader
 	Body []byte
 	Fds  []int
-
-	/*
-	   union {
-	       uint64_t u64;
-	       // defined in vhost.h
-	       struct vhostu_vring_state state;
-	       struct vhostu_vring_addr addr;
-	       struct vhost_user_memory memory;
-	   };
-	*/
 }
 
 // vhost_memory structure is used to declare which memory address
@@ -244,19 +240,30 @@ type Device struct {
 
 	vhostReady bool
 
+	closed atomic.Bool
+
 	memTable []*MemoryTableEntry
+	recv     *Virtq
 	xmit     *Virtq
 
+	xmitBuffers buffers
+
 	pp PacketProcessor
+
+	bufLock  atomic.Int32
+	txBuf    *ringbuf.RingBuf[*ethswitch.Frame]
+	txcharge chan struct{}
 }
 
 func NewDevice(log logger.Logger, conn *net.UnixConn, pp PacketProcessor) *Device {
 	d := &Device{
-		log:  log,
-		conn: conn,
-		buf:  make([]byte, 1024*10),
-		obuf: make([]byte, 1024*10),
-		pp:   pp,
+		log:      log,
+		conn:     conn,
+		buf:      make([]byte, 1024*10),
+		obuf:     make([]byte, 1024*10),
+		pp:       pp,
+		txBuf:    ringbuf.NewRingBuf[*ethswitch.Frame](1024),
+		txcharge: make(chan struct{}, 1024),
 	}
 
 	d.initVirtq()
@@ -281,12 +288,9 @@ type Virtq struct {
 	num    uint32
 	callFD int
 	kickFD int
-}
 
-func (v *Virtq) put_buffer(header_id uint16, total_size uint32) {
-	v.ring.used.SetRing(int(v.last_used_idx&v.num-1), uint32(header_id), total_size)
-
-	v.last_used_idx = (v.last_used_idx + 1) & math.MaxUint16
+	callIO *os.File
+	kickIO *os.File
 }
 
 func (d *Device) initVirtq() {
@@ -387,7 +391,47 @@ func (d *Device) replyState(msg *UserMsg, s *vhostu_vring_state) error {
 	return err
 }
 
+func (d *Device) Startup(ctx context.Context) error {
+	var msg UserMsg
+
+	for {
+		if d.xmit != nil && d.recv != nil {
+			go d.driveTx(ctx)
+			return nil
+		}
+
+		msg.Body = msg.Body[:0]
+
+		err := d.Receive(&msg)
+		if err != nil {
+			return err
+		}
+
+		err = d.dispatch(&msg)
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (d *Device) Close() error {
+	d.closed.Store(true)
+
+	if d.recv != nil {
+		d.recv.kickIO.Close()
+		d.recv.callIO.Close()
+	}
+
+	if d.xmit != nil {
+		d.xmit.kickIO.Close()
+		d.xmit.callIO.Close()
+	}
+
+	return nil
+}
+
 func (d *Device) Process() error {
+	go d.watchTxCall()
 	var msg UserMsg
 
 	for {
@@ -565,12 +609,10 @@ func (d *Device) set_mem_table(msg *UserMsg) error {
 			return err
 		}
 
-		/*
-			err = unix.Close(fd)
-			if err != nil {
-				d.log.Warn("error closing mmap fd", "error", err)
-			}
-		*/
+		err = unix.Close(fd)
+		if err != nil {
+			d.log.Warn("error closing mmap fd", "error", err)
+		}
 
 		mappedAddress := uintptr(unsafe.Pointer(&ptr[0]))
 		mappedAddress += uintptr(mr.Mmap_offset)
@@ -600,28 +642,16 @@ func (d *Device) fromQemuOffset(addr uint64) uint64 {
 	return 0
 }
 
-/*
-
-mapped address 139741475729408 => 140167157760000 (base=140167071940608, user=139741389910016
-mapped address 139741475733504 => 140167157764096 (base=140167071940608, user=139741389910016
-mapped address 139741475737600 => 140167157768192 (base=140167071940608, user=139741389910016
-
-*/
-
 func (d *Device) mapFromQemu(addr uint64) []byte {
 	for _, e := range d.memTable {
 		if e.containsQemu(addr) {
 			dpdk := addr + e.Guest + uint64(e.MappedAddress) - e.Qemu
-			//va := addr + e.Guest + e.Offset - e.Qemu
 			offset := addr - e.Qemu
 			d.log.Trace("mapped address from qemu", "addr", addr,
 				"region", e.Qemu, "region-size", e.DataSize, "offset", offset,
 				"dpdk", dpdk, "dpdk-offset", dpdk-uint64(e.MappedAddress),
 			)
 
-			//used := (*VRingUsed)(unsafe.Pointer(uintptr(dpdk)))
-
-			//spew.Dump(used)
 			return e.Data[offset:]
 		}
 	}
@@ -643,6 +673,8 @@ func (d *Device) set_vring_num(msg *UserMsg) error {
 	s := msg.VRingState()
 
 	d.virtq[s.Index].num = s.Num
+
+	d.log.Info("virtq num set", "index", s.Index, "num", s.Num)
 
 	pairs := (s.Index / 2) + 1
 	if pairs > d.virtq_pairs {
@@ -734,6 +766,7 @@ func (d *Device) set_vring_kick(msg *UserMsg) error {
 
 	if validFd {
 		d.virtq[idx].kickFD = msg.Fds[0]
+		d.virtq[idx].kickIO = os.NewFile(uintptr(msg.Fds[0]), "call")
 		d.log.Trace("configured kickfd", "ring", idx, "fd", msg.Fds[0])
 	}
 
@@ -747,6 +780,8 @@ func (d *Device) set_vring_call(msg *UserMsg) error {
 
 	if validFd {
 		d.virtq[idx].callFD = msg.Fds[0]
+		d.virtq[idx].callIO = os.NewFile(uintptr(msg.Fds[0]), "call")
+
 		d.log.Trace("configured callfd", "ring", idx, "fd", msg.Fds[0])
 	}
 
@@ -772,6 +807,82 @@ func (d *Device) get_queue_num(_ *UserMsg) error {
 	return nil
 }
 
+func (d *Device) watchTxCall() {
+	v := d.xmit
+
+	buf := make([]byte, 8)
+
+	for {
+		n, err := v.callIO.Read(buf)
+		if err != nil {
+			d.log.Error("error watching txcall", "error", err)
+			return
+		}
+
+		if n != 0 {
+			d.log.Trace("detected tx buffers ready")
+		}
+	}
+}
+
+func (d *Device) ReceiveFrame(ctx context.Context, fn func(frame []byte) error) error {
+	v := d.recv
+
+	kickBuf := make([]byte, 8)
+
+	var output bytes.Buffer
+	var b buffers
+
+	f := v.kickIO
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if d.closed.Load() {
+				return nil
+			}
+		}
+
+		for {
+			buffers, d_idx, err := d.getNextBuffer(v, &b)
+			if err != nil {
+				d.log.Error("error handling packets", "error", err)
+				continue
+			}
+
+			if buffers == nil {
+				break
+			}
+
+			output.Reset()
+
+			for _, b := range buffers {
+				output.Write(b)
+			}
+
+			d.log.Trace("gpv5: packet read", "size", output.Len())
+
+			d.returnBuffer(v, buffers, d_idx)
+			d.signalUsed(v)
+
+			err = fn(output.Bytes()[virtio_net_hdr_size:])
+			if err != nil {
+				return err
+			}
+		}
+
+		n, err := f.Read(kickBuf)
+		if err != nil {
+			d.log.Error("reading kick failed", "error", err)
+			return err
+		}
+
+		d.log.Trace("kick was read", "cnt", n)
+	}
+}
+
 func (d *Device) set_vring_enable(msg *UserMsg) error {
 	state := msg.VRingState()
 	d.vhostReady = state.Index > 0
@@ -780,8 +891,10 @@ func (d *Device) set_vring_enable(msg *UserMsg) error {
 	virtq := d.virtq[state.Index]
 	if virtq != nil && virtq.kickFD != 0 {
 		if state.Index == 1 {
-			d.log.Info("starting goroutine to process kick requests")
-			go d.watchKick(virtq)
+			d.log.Info("registered virtq as recv", "index", state.Index)
+			d.recv = virtq
+			//d.log.Info("starting goroutine to process kick requests")
+			//go d.watchKick(virtq)
 		} else {
 			d.log.Info("registered virtq as txmit", "index", state.Index)
 			d.xmit = virtq
@@ -789,87 +902,6 @@ func (d *Device) set_vring_enable(msg *UserMsg) error {
 	}
 	return nil
 }
-
-func (d *Device) watchKick(v *Virtq) {
-	buf := make([]byte, 8)
-
-	f := os.NewFile(uintptr(v.kickFD), "kick")
-
-	for {
-		n, err := f.Read(buf)
-		if err != nil {
-			d.log.Error("reading kick failed", "error", err)
-			return
-		}
-
-		d.log.Trace("kick was read", "cnt", n)
-
-		err = d.getPackets(v, d.pp, 0)
-		if err != nil {
-			d.log.Error("error handling packets", "error", err)
-		}
-	}
-}
-
-func (d *Device) receivePackets(pp PacketProcessor, hdr_len uint32) error {
-	for i := 0; i < int(d.virtq_pairs); i++ {
-		ring_id := 2*i + 1
-		virtq := d.virtq[ring_id]
-
-		err := d.getPackets(virtq, pp, hdr_len)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-/*
--- Receive all available packets from the virtual machine.
-function VirtioVirtq:get_buffers (kind, ops, hdr_len)
-
-	local device = self.device
-	local idx = self.virtq.avail.idx
-	local avail, vring_mask = self.avail, self.vring_num-1
-
-	while idx ~= avail do
-
-	   -- Header
-	   local v_header_id = self.virtq.avail.ring[band(avail,vring_mask)]
-	   local desc, id = self:get_desc(v_header_id)
-
-	   local data_desc = desc[id]
-
-	   local packet =
-	      ops.packet_start(device, data_desc.addr, data_desc.len)
-	   local total_size = hdr_len
-
-	   if not packet then break end
-
-	   -- support ANY_LAYOUT
-	   if hdr_len < data_desc.len then
-	      local addr = data_desc.addr + hdr_len
-	      local len = data_desc.len - hdr_len
-	      local added_len = ops.buffer_add(device, packet, addr, len)
-	      total_size = total_size + added_len
-	   end
-
-	   -- Data buffer
-	   while band(data_desc.flags, C.VIRTIO_DESC_F_NEXT) ~= 0 do
-	      data_desc  = desc[data_desc.next]
-	      local added_len = ops.buffer_add(device, packet, data_desc.addr, data_desc.len)
-	      total_size = total_size + added_len
-	   end
-
-	   ops.packet_end(device, v_header_id, total_size, packet)
-
-	   avail = band(avail + 1, 65535)
-	end
-	self.avail = avail
-
-end
-*/
 
 type Packet struct {
 	buf bytes.Buffer
@@ -889,139 +921,193 @@ func (d *Device) bufFromGuest(addr uint64, sz uint32) ([]byte, error) {
 	return nil, fmt.Errorf("mapping to host buffer failed: %d", addr)
 }
 
-func (d *Device) getPackets(v *Virtq, pp PacketProcessor, hdr_len uint32) error {
-	buffers, d_idx, err := d.getNextBuffer(v)
-	if err != nil {
-		return err
-	}
+func (d *Device) TransmitFrames(ctx context.Context, input ethswitch.TxFrameReturner) (int, error) {
+	var cnt int
 
-	buf := buffers[0]
-
-	d.log.Trace("gpv4: packet read", "size", len(buf))
-
-	data := buf[virtio_net_hdr_size:]
-	pkt := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.Default)
-	fmt.Println(pkt.Dump())
-
-	d.returnBuffer(v, buffers, d_idx)
-	d.signalUsed(v)
-
-	return d.sendTestPacket()
-}
-
-var (
-	lldpDest net.HardwareAddr
-	noSrc    net.HardwareAddr
-)
-
-func init() {
-	lldpDest, _ = net.ParseMAC("01:80:c2:00:00:0e")
-	noSrc, _ = net.ParseMAC("00:00:00:00:00:00")
-}
-
-func (d *Device) sendTestPacket() error {
 	v := d.xmit
 
-	lfr := lldp.Frame{
-		ChassisID: &lldp.ChassisID{
-			Subtype: lldp.ChassisIDSubtypeInterfaceName,
-			ID:      []byte("sys0"),
-		},
-		PortID: &lldp.PortID{
-			Subtype: lldp.PortIDSubtypeInterfaceName,
-			ID:      []byte("lnf0"),
-		},
-		TTL: 1 * time.Minute,
+	for {
+		buffers, d_idx, err := d.getNextBuffer(v, &d.xmitBuffers)
+		if err != nil {
+			return cnt, errors.Wrapf(err, "sending test packet")
+		}
+
+		if buffers == nil {
+			return cnt, nil
+		}
+
+		buf := buffers[0]
+
+		f, ok := input.PopTxFrame()
+		if !ok {
+			return cnt, nil
+		}
+
+		frame := f.Data
+
+		if len(frame) > len(buf) {
+			return cnt, fmt.Errorf("jumbo frames not implemented yet")
+		}
+
+		buf = buf[:10+len(frame)]
+		clear(buf[:10])
+		copy(buf[10:], frame)
+
+		buffers[0] = buf
+
+		d.log.Trace("gpv6: transmitting frame", "size", len(buf))
+
+		d.returnBuffer(v, buffers, d_idx)
+		d.signalUsed(v)
+	}
+}
+
+func (d *Device) driveTx(ctx context.Context) error {
+	v := d.xmit
+
+	d.log.Info("tx loop started")
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-d.txcharge:
+			// ok
+		}
+
+		var used int
+
+		for !d.txBuf.EmptyP() {
+		retry:
+			buffers, d_idx, err := d.getNextBuffer(v, &d.xmitBuffers)
+			if err != nil {
+				return errors.Wrapf(err, "sending test packet")
+			}
+
+			if buffers == nil {
+				time.Sleep(time.Microsecond)
+				goto retry
+			}
+
+			qf, ok := d.txBuf.Pop()
+			if !ok {
+				break
+			}
+
+			d.useBuffer(v, buffers, d_idx, qf)
+			used++
+
+			qf.Discard(d.log)
+
+			if used > 50 {
+				d.signalUsed(v)
+			}
+		}
+
+		d.signalUsed(v)
+	}
+}
+
+func (d *Device) TransmitFrame(ctx context.Context, input *ethswitch.Frame) error {
+	if len(input.Data) > 1600 {
+		return fmt.Errorf("jumbo frames not implemented yet")
 	}
 
-	lld, err := lfr.MarshalBinary()
-	if err != nil {
-		return err
+	input.IncRef(1)
+
+retry:
+	if d.txBuf.Push(input) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case d.txcharge <- struct{}{}:
+			// ok
+		}
+	} else {
+		time.Sleep(50 * time.Microsecond)
+		goto retry
 	}
 
-	fr := ethernet.Frame{
-		Destination: lldpDest,
-		Source:      noSrc,
-		EtherType:   lldp.EtherType,
-		Payload:     lld,
+	return nil
+}
+
+func (d *Device) TransmitFramex(ctx context.Context, input *ethswitch.Frame) error {
+	if len(input.Data) > 1600 {
+		return fmt.Errorf("jumbo frames not implemented yet")
 	}
 
-	pktData, err := fr.MarshalBinary()
-	if err != nil {
-		return err
-	}
+	v := d.xmit
 
-	buffers, d_idx, err := d.getNextBuffer(v)
+retry:
+
+	buffers, d_idx, err := d.getNextBuffer(v, &d.xmitBuffers)
 	if err != nil {
 		return errors.Wrapf(err, "sending test packet")
 	}
 
+	if buffers == nil {
+		time.Sleep(time.Microsecond)
+
+		goto retry
+		/*
+			if d.txBuf.FullP() {
+				goto retry
+			}
+
+			d.txBuf.Push(input)
+			return nil
+		*/
+	}
+
+	/*
+		if !d.txBuf.EmptyP() {
+			qf, ok := d.txBuf.Pop()
+			if ok {
+				d.useBuffer(v, buffers, d_idx, qf)
+			}
+			goto retry
+		}
+	*/
+
+	d.useBuffer(v, buffers, d_idx, input)
+
+	d.signalUsed(v)
+	return nil
+}
+
+func (d *Device) useBuffer(v *Virtq, buffers [][]byte, d_idx uint16, fr *ethswitch.Frame) {
 	buf := buffers[0]
 
-	buf = buf[:10+len(pktData)]
+	frame := fr.Data
+
+	buf = buf[:10+len(frame)]
 	clear(buf[:10])
-	copy(buf[10:], pktData)
+	copy(buf[10:], frame)
 
 	buffers[0] = buf
 
-	d.log.Trace("gpv4: test lldp packet write", "size", len(buf))
+	if d.log.IsTrace() {
+		d.log.Trace("gpv6: transmitted frame", "size", len(buf))
+	}
 
 	d.returnBuffer(v, buffers, d_idx)
-	d.signalUsed(v)
-
-	return nil
 }
 
-func (d *Device) getPackets2(v *Virtq, pp PacketProcessor, hdr_len uint32) error {
-	avail := v.ring.avail
-	used := v.ring.used
-	num := v.num
-
-	a_idx := v.last_avail_idx % num
-
-	for v.last_avail_idx != uint32(avail.Idx()) {
-
-		d.process_desc(v, a_idx, pp, hdr_len)
-
-		a_idx = (a_idx + 1) % num
-		v.last_avail_idx++
-		v.last_used_idx++
-	}
-
-	used.SetIdx(uint16(v.last_used_idx))
-	unix.Msync(used.data, unix.MS_SYNC|unix.MS_INVALIDATE)
-
-	if avail.Flags()&VRING_F_NO_INTERRUPT == 0 {
-		d.log.Trace("signaling used")
-		unix.Write(v.callFD, kickBuf)
-	}
-
-	return nil
+type buffers struct {
+	data [][]byte
 }
 
-/* Frame (60 bytes) */
-var arp_request = [...]byte{0xff, 0xff, 0xff, 0xff, 0xff,
-	0xff,                               /* DST MAC - broadcast */
-	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, /* SRC MAC -01:02:03:04:05:06 */
-	0x08, 0x06, /* Eth Type - ARP */
-	0x00, 0x01, /* Ethernet */
-	0x08, 0x00, /* Protocol - IP */
-	0x06,       /* HW size */
-	0x04,       /* Protocol size */
-	0x00, 0x01, /* Request */
-	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, /* Sender MAC */
-	0xc0, 0xa8, 0x00, 0x02, /* Sender IP - 192.168.0.2*/
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* Target MAC */
-	0xc0, 0xa8, 0x00, 0x01, /* Target IP - 192.168.0.1*/
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* Padding */
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+func (d *Device) getNextBuffer(v *Virtq, b *buffers) ([][]byte, uint16, error) {
+	for !d.bufLock.CompareAndSwap(0, 1) {
+		// spin loop!
+	}
 
-func (d *Device) getNextBuffer(v *Virtq) ([][]byte, uint16, error) {
 	desc := v.ring.desc
 	avail := v.ring.avail
 
 	if v.last_avail_idx == uint32(avail.Idx()) {
-		return nil, 0, fmt.Errorf("no buffers available")
+		d.bufLock.Store(0)
+		return nil, 0, nil
 	}
 
 	d_idx := avail.Ring(v.last_avail_idx % v.num)
@@ -1031,10 +1117,12 @@ func (d *Device) getNextBuffer(v *Virtq) ([][]byte, uint16, error) {
 		desc.Len(int(d_idx)),
 	)
 	if err != nil {
+		d.bufLock.Store(0)
+		d.log.Error("error retrieving buffer", "error", err, "idx", d_idx)
 		return nil, 0, err
 	}
 
-	var ret [][]byte
+	ret := b.data[:0]
 
 	ret = append(ret, buf)
 
@@ -1048,6 +1136,7 @@ func (d *Device) getNextBuffer(v *Virtq) ([][]byte, uint16, error) {
 			desc.Len(int(d_idx)),
 		)
 		if err != nil {
+			d.bufLock.Store(0)
 			return nil, 0, err
 		}
 
@@ -1056,6 +1145,9 @@ func (d *Device) getNextBuffer(v *Virtq) ([][]byte, uint16, error) {
 
 	v.last_avail_idx = (v.last_avail_idx + 1) & math.MaxUint16
 
+	b.data = ret[:0]
+
+	d.bufLock.Store(0)
 	return ret, header, nil
 }
 
@@ -1073,225 +1165,7 @@ func (d *Device) returnBuffer(v *Virtq, buffers [][]byte, idx uint16) {
 func (d *Device) signalUsed(v *Virtq) {
 	if v.ring.used.Idx() != uint16(v.last_used_idx) {
 		v.ring.used.SetIdx(uint16(v.last_used_idx))
-		unix.Msync(v.ring.used.data, unix.MS_SYNC|unix.MS_INVALIDATE)
+		//unix.Msync(v.ring.used.data, unix.MS_SYNC|unix.MS_INVALIDATE)
 		unix.Write(v.callFD, kickBuf)
 	}
 }
-
-func (d *Device) process_desc(v *Virtq, a_idx uint32, pp PacketProcessor, _ uint32) error {
-	desc := v.ring.desc
-	avail := v.ring.avail
-	used := v.ring.used
-
-	d_idx := avail.Ring(a_idx)
-
-	i := d_idx
-
-	var output bytes.Buffer
-
-	var llen uint32 = 0
-
-	for {
-		d.log.Trace("process desc", "a_idx", a_idx, "i", i)
-
-		cur_len := desc.Len(int(i))
-
-		buf, err := d.bufFromGuest(desc.Addr(int(i)), cur_len)
-		if err != nil {
-			return err
-		}
-
-		output.Write(buf)
-
-		llen += cur_len
-
-		if desc.Flags(int(i))&VIRTIO_DESC_F_NEXT != 0 {
-			i = desc.Next(int(i))
-		} else {
-			break
-		}
-	}
-
-	if llen == 0 {
-		return nil
-	}
-
-	num := v.num
-	u_idx := v.last_used_idx % num
-	used.SetRing(int(u_idx), uint32(d_idx), llen)
-
-	d.log.Trace("packet read", "size", output.Len())
-
-	data := output.Bytes()[virtio_net_hdr_size:]
-	pkt := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.Default)
-	fmt.Println(pkt.Dump())
-
-	if d.xmit != nil {
-		d.log.Trace("echoing packet back")
-
-		err := d.put_vring(d.xmit, arp_request[:])
-		if err != nil {
-			d.log.Error("error putting packet back", "error", err)
-		}
-	}
-
-	return nil
-}
-
-func (d *Device) put_vring(v *Virtq, data []byte) error {
-	desc := v.ring.desc
-	avail := v.ring.avail
-	used := v.ring.used
-
-	num := v.num
-
-	a_idx := v.last_avail_idx
-
-	d_idx := avail.Ring(a_idx)
-
-	dlen := desc.Len(int(d_idx))
-
-	if len(data) > int(dlen) {
-		return fmt.Errorf("descriptor too small %d < %d", dlen, len(data))
-	}
-
-	//v.last_avail_idx = uint32(desc.Next(int(a_idx)))
-
-	buf, err := d.bufFromGuest(desc.Addr(int(d_idx)), dlen)
-	if err != nil {
-		return err
-	}
-
-	v.last_avail_idx = (a_idx + 1) & math.MaxUint16
-
-	clear(buf[:10])
-	copy(buf[10:], data)
-
-	desc.SetLen(int(a_idx), uint32(10+len(data)))
-	desc.SetFlags(int(a_idx), 0)
-	desc.SetNext(int(a_idx), math.MaxUint16)
-
-	avail.SetRing(uint32(avail.Idx())%num, uint16(a_idx))
-	avail.SetIdx(avail.Idx() + 1)
-
-	unix.Msync(avail.data, unix.MS_SYNC|unix.MS_INVALIDATE)
-	unix.Msync(buf, unix.MS_SYNC|unix.MS_INVALIDATE)
-
-	u_idx := v.last_used_idx % num
-	v.last_used_idx = (u_idx + 1) & math.MaxUint16
-
-	used.SetRing(int(u_idx), a_idx, uint32(10+len(data)))
-	used.SetIdx(uint16(u_idx))
-	unix.Msync(used.data, unix.MS_SYNC|unix.MS_INVALIDATE)
-
-	unix.Write(v.callFD, kickBuf)
-	unix.Fsync(v.callFD)
-
-	unix.Write(v.kickFD, kickBuf)
-	unix.Fsync(v.kickFD)
-
-	return nil
-}
-
-var kickBuf = make([]byte, 8)
-
-func init() {
-	binary.NativeEndian.PutUint64(kickBuf, 1)
-}
-
-/*
-func (d *Device) getPackets2(v *Virtq, pp PacketProcessor, hdr_len uint32) error {
-	//local idx = self.virtq.avail.idx
-	idx := uint32(v.ring.avail.Idx())
-
-	//local avail, vring_mask = self.avail, self.vring_num-1
-	avail := v.last_avail_idx
-	vring_mask := v.num - 1
-
-	d.log.Trace("processing data in ring", "idx", idx, "avail", avail, "num", v.num)
-	for idx != avail {
-		//-- Header
-		//local v_header_id = self.virtq.avail.ring[band(avail,vring_mask)]
-		header_id := v.ring.avail.Ring(avail & vring_mask)
-		//local desc, id = self:get_desc(v_header_id)
-
-		data_addr := v.ring.desc.Addr(int(header_id))
-		data_len := v.ring.desc.Len(int(header_id))
-		//data_desc := v.ring.desc[header_id]
-
-		//local data_desc = desc[id]
-		//data_desc := desc.flags
-
-		d.log.Trace("reading data", "idx", idx, "id", header_id, "addr", data_addr, "len", data_len)
-
-		buf, err := d.bufFromGuest(data_addr, data_len)
-		if err != nil {
-			return err
-		}
-
-		packet, err := pp.PacketStart(buf)
-		if err != nil {
-			return err
-		}
-
-		if packet == nil {
-			break
-		}
-
-		total_size := hdr_len
-
-		if hdr_len < data_len {
-			addr := data_addr + uint64(hdr_len)
-			sz := data_len - hdr_len
-
-			buf, err := d.bufFromGuest(addr, sz)
-			if err != nil {
-				return err
-			}
-
-			added_len, err := pp.BufferAdd(packet, buf)
-			if err != nil {
-				return err
-			}
-
-			total_size += added_len
-		}
-
-		flags := v.ring.desc.Flags(int(header_id))
-		next := v.ring.desc.Next(int(header_id))
-
-		for flags&VIRTIO_DESC_F_NEXT != 0 {
-			//data_desc := v.ring.desc[data_desc.next]
-			data_addr := v.ring.desc.Addr(int(next))
-			data_len := v.ring.desc.Len(int(next))
-
-			buf, err := d.bufFromGuest(data_addr, data_len)
-			if err != nil {
-				return err
-			}
-
-			added_len, err := pp.BufferAdd(packet, buf)
-			if err != nil {
-				return err
-			}
-
-			total_size += added_len
-
-			flags = v.ring.desc.Flags(int(next))
-			next = v.ring.desc.Next(int(next))
-		}
-
-		pp.PacketEnd(packet, header_id, total_size)
-
-		v.ring.used.SetRing(int(idx), uint32(header_id), total_size)
-		//v.put_buffer(header_id, total_size)
-
-		avail = (avail + 1) & math.MaxUint16 // loop back to 0
-	}
-
-	v.last_avail_idx = avail
-
-	return nil
-}
-
-*/

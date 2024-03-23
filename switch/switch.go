@@ -2,7 +2,9 @@ package ethswitch
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -12,8 +14,15 @@ import (
 )
 
 type PortDevice interface {
-	Receive(ctx context.Context, fn func(frame []byte) error)
-	Transmit(ctx context.Context, frame []byte) error
+	ReceiveFrame(ctx context.Context, fn func(frame []byte) error) error
+	TransmitFrame(ctx context.Context, frame *Frame) error
+}
+
+type PortMetadata struct {
+	PortId              string
+	SystemName          string
+	ManagementAddresses []netip.Addr
+	Description         string
 }
 
 type Port struct {
@@ -25,7 +34,10 @@ type Port struct {
 	TxCount uint64
 	RxCount uint64
 
-	tick *time.Ticker
+	Metadata *PortMetadata
+
+	tick   *time.Ticker
+	cancel func()
 }
 
 type Switch struct {
@@ -33,36 +45,88 @@ type Switch struct {
 
 	mu    sync.Mutex
 	ports map[string]*Port
-	tbl   map[string]*Port
+	tbl   map[HardwareAddr]*Port
+
+	nextPortNum int64
 }
 
 func NewSwitch(log logger.Logger) *Switch {
 	s := &Switch{
 		log:   log,
 		ports: make(map[string]*Port),
-		tbl:   make(map[string]*Port),
+		tbl:   make(map[HardwareAddr]*Port),
+
+		nextPortNum: 100,
 	}
 
+	s.AddInternalPort()
+
 	return s
+}
+
+func (s *Switch) NextPortName() string {
+	id := s.nextPortNum
+	s.nextPortNum++
+
+	return fmt.Sprintf("p%d", id)
+}
+
+func (s *Switch) AddInternalPort() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ip := &InternalPort{
+		sw: s,
+	}
+
+	port := &Port{
+		Name:      "p0",
+		Device:    ip,
+		CreatedAt: time.Now(),
+		tick:      time.NewTicker(1 * time.Minute),
+		cancel:    func() {},
+	}
+
+	s.log.Trace("added internal port", "name", port.Name)
+
+	s.ports[port.Name] = port
 }
 
 func (s *Switch) AddPort(ctx context.Context, name string, dev PortDevice) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	ctx, cancel := context.WithCancel(ctx)
+
 	port := &Port{
 		Name:      name,
 		Device:    dev,
 		CreatedAt: time.Now(),
 		tick:      time.NewTicker(1 * time.Minute),
+		cancel:    cancel,
 	}
 	s.ports[name] = port
 
 	go s.portTick(ctx, port)
 
-	go dev.Receive(ctx, func(frame []byte) error {
+	go dev.ReceiveFrame(ctx, func(frame []byte) error {
 		return s.inputFrame(ctx, port, frame)
 	})
+
+	return nil
+}
+
+func (s *Switch) DelPort(ctx context.Context, name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	port := s.ports[name]
+
+	if port == nil {
+		return nil
+	}
+
+	port.cancel()
 
 	return nil
 }
@@ -122,42 +186,50 @@ func (s *Switch) sendLLDP(ctx context.Context, port *Port) error {
 		return err
 	}
 
-	return port.Device.Transmit(ctx, pktData)
+	return port.Device.TransmitFrame(ctx, NewFrame(pktData, nil))
 }
 
-func (s *Switch) learn(port *Port, src string) {
+func (s *Switch) learn(port *Port, src HardwareAddr) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.tbl[src] = port
+	if curPort, ok := s.tbl[src]; !ok || curPort != port {
+		s.log.Trace("learned port", "port", port.Name, "src-addr", src)
+		s.tbl[src] = port
+	}
 }
 
-func (s *Switch) lookup(dest string) *Port {
+func (s *Switch) lookup(dest HardwareAddr) *Port {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	return s.tbl[dest]
 }
 
-func (s *Switch) inputFrame(ctx context.Context, port *Port, frame []byte) error {
+func (s *Switch) inputFrame(ctx context.Context, port *Port, data []byte) error {
 	port.LastFrame = time.Now()
 	port.RxCount++
 
-	dest := net.HardwareAddr(frame[0:6])
+	dest := HardwareAddr(data[0:6])
 
-	src := net.HardwareAddr(frame[6:12])
+	src := HardwareAddr(data[6:12])
 
-	s.learn(port, src.String())
+	s.learn(port, src)
 
-	destPort := s.lookup(dest.String())
+	frame := NewFrame(data, port)
+	defer frame.Discard(s.log)
+
+	destPort := s.lookup(dest)
 	if destPort == nil {
+		s.log.Trace("broadcasting frame")
 		return s.broadcast(ctx, port, frame)
 	} else {
+		s.log.Trace("unicasting frame")
 		return s.txTo(ctx, destPort, frame)
 	}
 }
 
-func (s *Switch) broadcast(ctx context.Context, srcPort *Port, frame []byte) error {
+func (s *Switch) broadcast(ctx context.Context, srcPort *Port, frame *Frame) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -166,12 +238,15 @@ func (s *Switch) broadcast(ctx context.Context, srcPort *Port, frame []byte) err
 			continue
 		}
 
-		s.txTo(ctx, port, frame)
+		err := s.txTo(ctx, port, frame)
+		if err != nil {
+			s.log.Error("error transmitting to port", "port", port.Name, "error", err)
+		}
 	}
 
 	return nil
 }
 
-func (s *Switch) txTo(ctx context.Context, destPort *Port, frame []byte) error {
-	return destPort.Device.Transmit(ctx, frame)
+func (s *Switch) txTo(ctx context.Context, destPort *Port, frame *Frame) error {
+	return destPort.Device.TransmitFrame(ctx, frame)
 }
